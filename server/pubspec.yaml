@@ -1,0 +1,11 @@
+name: domna_server
+publish_to: none
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+dependencies:
+  domna_rules:
+    path: ../packages/domna_rules
+  dart_jsonwebtoken: 3.3.1
+  crypto: 3.0.6
+dev_dependencies:
+  test: 1.26.3
