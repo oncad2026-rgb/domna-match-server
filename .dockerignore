@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!server/
+!server/pubspec.yaml
+!server/pubspec.lock
+!server/lib/
+!server/lib/**
+!server/bin/
+!server/bin/server.dart
+!packages/
+!packages/domna_rules/
+!packages/domna_rules/pubspec.yaml
+!packages/domna_rules/lib/
+!packages/domna_rules/lib/**
