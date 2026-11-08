@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:domna_rules/domino_engine.dart';
+import 'package:domna_rules/table_signals.dart';
 
 typedef Json = Map<String, dynamic>;
 
@@ -23,6 +24,8 @@ class Authority {
   final Random _random;
   final rooms = <String, Room>{};
   final history = <Json>[];
+  final _leaders = <String, Json>{};
+  final _invites = <String, Json>{};
   int generation = 0;
 
   String _code() {
@@ -70,6 +73,28 @@ class Authority {
       case 'current':
         final room = _active(uid);
         return {'room': room == null ? null : _view(room, uid)};
+      case 'rankings':
+        return _rankings(uid, request);
+      case 'invite':
+        return _invite(uid, request);
+      case 'invitations':
+        return {
+          'hasMatch': _active(uid) != null,
+          'invitations': [
+            for (final entry in _invites.entries)
+              if (entry.value['to'] == uid &&
+                  (entry.value['until'] as int) > now() &&
+                  entry.value['room'] == null &&
+                  entry.value['declined'] != true)
+                {
+                  'id': entry.key,
+                  'name': _leaders[entry.value['from']]?['name'] ?? '',
+                },
+          ],
+        };
+      case 'accept_invite':
+      case 'decline_invite':
+        return _answerInvite(uid, request, accept: op == 'accept_invite');
       case 'history':
         return {
           'matches': [
@@ -83,6 +108,7 @@ class Authority {
                   'winner': entry['winner'],
                   'seat': (entry['uids'] as List).indexOf(uid),
                   'reason': entry['reason'],
+                  'forfeited': entry['forfeited'] ?? [],
                 },
           ].take(50).toList(),
         };
@@ -111,11 +137,218 @@ class Authority {
       case 'state':
         final room = _member(uid, request);
         return {'room': _view(room, uid)};
+      case 'table_signal':
+        return _tableSignal(uid, request);
       case 'command':
         return _command(uid, request);
       default:
         throw const MatchFault('online_invalid', 400);
     }
+  }
+
+  String _month(int timestamp) => DateTime.fromMillisecondsSinceEpoch(
+    timestamp,
+    isUtc: true,
+  ).toIso8601String().substring(0, 7);
+
+  Json? _profile(String uid, Object? name, Object? avatar) {
+    final current = _leaders[uid];
+    final safe = String.fromCharCodes(
+      _text(name, 100)
+          .replaceAll(
+            RegExp(r'[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]'),
+            '',
+          )
+          .trim()
+          .runes
+          .take(20),
+    );
+    if (current == null && (safe.isEmpty || _leaders.length >= 10000)) {
+      return null;
+    }
+    final profile =
+        current ??
+        (_leaders[uid] = {
+          'name': safe,
+          'avatar': 0,
+          'wins': 0,
+          'losses': 0,
+          'monthlyWins': 0,
+          'monthlyLosses': 0,
+        });
+    if (safe.isNotEmpty) {
+      final picture = avatar is int && avatar >= 0 && avatar <= 5 ? avatar : 0;
+      if (current == null ||
+          profile['name'] != safe ||
+          profile['avatar'] != picture) {
+        profile['name'] = safe;
+        profile['avatar'] = picture;
+        generation++;
+      }
+    }
+    return profile;
+  }
+
+  Json _rankings(String uid, Json request) {
+    _profile(uid, request['name'], request['avatar']);
+    final monthly = request['period'] == 'monthly';
+    final month = _month(now());
+    final rawIds = request['ids'];
+    if (rawIds != null && (rawIds is! List || rawIds.length > 61)) {
+      throw const MatchFault('online_invalid', 400);
+    }
+    final ids = rawIds is List ? rawIds.whereType<String>().toSet() : null;
+    final rows = <Json>[];
+    for (final entry in _leaders.entries) {
+      if (ids != null && !ids.contains(entry.key)) continue;
+      final p = entry.value;
+      final current = p['month'] == month;
+      final wins = monthly
+          ? (current ? p['monthlyWins'] as int : 0)
+          : p['wins'] as int;
+      final losses = monthly
+          ? (current ? p['monthlyLosses'] as int : 0)
+          : p['losses'] as int;
+      if (monthly && wins + losses == 0) continue;
+      rows.add({
+        'id': entry.key,
+        'name': p['name'],
+        'avatar': p['avatar'],
+        'wins': wins,
+        'losses': losses,
+        'points': wins * 3,
+      });
+    }
+    rows.sort((a, b) {
+      final score = (b['points'] as int).compareTo(a['points'] as int);
+      if (score != 0) return score;
+      final losses = (a['losses'] as int).compareTo(b['losses'] as int);
+      if (losses != 0) return losses;
+      return (a['id'] as String).compareTo(b['id'] as String);
+    });
+    return {'players': rows.take(50).toList()};
+  }
+
+  void _rankResult(Json entry) {
+    final uids = (entry['uids'] as List).cast<String>();
+    final names = (entry['names'] as List).cast<String>();
+    final winner = entry['winner'] as int?;
+    final forfeited = (entry['forfeited'] as List? ?? const []).cast<int>();
+    final month = _month(entry['finishedAt'] as int);
+    for (var i = 0; i < uids.length; i++) {
+      final profile = _leaders[uids[i]] ?? _profile(uids[i], names[i], 0);
+      if (profile == null) continue;
+      final won = i == winner;
+      if (winner == null && !forfeited.contains(i)) continue;
+      if (profile['month'] != month) {
+        profile['month'] = month;
+        profile['monthlyWins'] = 0;
+        profile['monthlyLosses'] = 0;
+      }
+      final total = won ? 'wins' : 'losses';
+      final recent = won ? 'monthlyWins' : 'monthlyLosses';
+      profile[total] = (profile[total] as int) + 1;
+      profile[recent] = (profile[recent] as int) + 1;
+    }
+  }
+
+  Json _invite(String uid, Json request) {
+    final target = request['target'];
+    if (target is! String || target == uid || !_leaders.containsKey(target)) {
+      throw const MatchFault('online_missing', 404);
+    }
+    if (_active(uid) != null || _active(target) != null) {
+      throw const MatchFault('challenge_busy');
+    }
+    if (_profile(uid, request['name'], request['avatar']) == null) {
+      throw const MatchFault('challenge_profile');
+    }
+    final time = now();
+    _invites.removeWhere((_, invite) => (invite['until'] as int) <= time);
+    final sent = _invites.values.where((invite) => invite['from'] == uid);
+    final previous = sent.where((invite) => invite['to'] == target).firstOrNull;
+    if (previous != null) {
+      if (previous['declined'] == true || previous['room'] != null) {
+        throw const MatchFault('online_slow');
+      }
+      return {'sent': true};
+    }
+    if (sent.length >= 5 ||
+        _invites.length >= 1000 ||
+        _invites.values.where((invite) => invite['to'] == target).length >=
+            20) {
+      throw const MatchFault('online_slow');
+    }
+    _invites[_newInviteId()] = {
+      'from': uid,
+      'to': target,
+      'until': time + 300000,
+    };
+    generation++;
+    return {'sent': true};
+  }
+
+  String _newInviteId() {
+    String id;
+    do {
+      id = _code();
+    } while (_invites.containsKey(id));
+    return id;
+  }
+
+  Json _answerInvite(String uid, Json request, {required bool accept}) {
+    final id = request['id'];
+    final invite = _invites[id];
+    if (invite == null ||
+        invite['to'] != uid ||
+        (invite['until'] as int) <= now()) {
+      throw const MatchFault('challenge_expired');
+    }
+    if (invite['room'] case final String code) {
+      if (!accept) throw const MatchFault('challenge_expired');
+      return {
+        'room': _view(_member(uid, {'code': code}), uid),
+      };
+    }
+    if (invite['declined'] == true) throw const MatchFault('challenge_expired');
+    if (!accept) {
+      invite['declined'] = true;
+      generation++;
+      return {'declined': true};
+    }
+    final from = invite['from'] as String;
+    if (_active(uid) != null || _active(from) != null) {
+      throw const MatchFault('challenge_busy');
+    }
+    if (rooms.length >= 1000) throw const MatchFault('online_capacity', 503);
+    final room = Room(
+      code: _code(),
+      players: 2,
+      rules: RuleSet.draw,
+      target: 100,
+      quick: false,
+      isPublic: false,
+      chatEnabled: true,
+      allowRejoin: true,
+      password: null,
+      touched: now(),
+      seats: [
+        _seat(from, _leaders[from]!)..ready = true,
+        _seat(uid, _leaders[uid]!)..ready = true,
+      ],
+    );
+    _start(room);
+    rooms[room.code] = room;
+    _invites.removeWhere(
+      (key, invitation) =>
+          key != id &&
+          invitation['room'] == null &&
+          ([from, uid].contains(invitation['from']) ||
+              [from, uid].contains(invitation['to'])),
+    );
+    invite['room'] = room.code;
+    generation++;
+    return {'room': _view(room, uid)};
   }
 
   Room _room(Json request) {
@@ -192,12 +425,68 @@ class Authority {
       '',
     );
     final avatar = request['avatar'];
+    _profile(uid, name, avatar);
     return Seat(
       uid,
       name,
       avatar is int && avatar >= 0 && avatar < 4 ? avatar : 0,
     )..lastSeen = now();
   }
+
+  Json _tableSignal(String uid, Json request) {
+    final room = _member(uid, request);
+    if (room.game == null || room.finished || !room.chatEnabled) {
+      throw const MatchFault('chat_unavailable');
+    }
+    final kind = TableSignalKind.values
+        .where((kind) => kind.name == request['kind'])
+        .firstOrNull;
+    final code = request['signal'];
+    final id = request['id'];
+    if (kind == null ||
+        code is! String ||
+        !kind.choices.containsKey(code) ||
+        id is! String ||
+        !RegExp(r'^[a-zA-Z0-9_-]{12,90}$').hasMatch(id)) {
+      throw const MatchFault('online_invalid', 400);
+    }
+
+    final time = now();
+    room.signals.removeWhere((event) => time - (event['at'] as int) > 10000);
+    final player = room.seats.indexWhere((seat) => seat.uid == uid);
+    final key = '$player:$id';
+    final existing = room.signals
+        .where((event) => event['id'] == key)
+        .firstOrNull;
+    if (existing != null) {
+      return {'signal': _signalView(existing, time)};
+    }
+    final last = room.signals.lastWhere(
+      (event) => event['seat'] == player && event['kind'] == kind.name,
+      orElse: () => const {},
+    );
+    if (last.isNotEmpty && time - (last['at'] as int) < kind.cooldownMs) {
+      throw const MatchFault('online_slow');
+    }
+    final event = {
+      'id': key,
+      'seat': player,
+      'kind': kind.name,
+      'signal': code,
+      'at': time,
+    };
+    // Transient room events must not advance the board revision or deadline.
+    room.signals.add(event);
+    return {'signal': _signalView(event, time)};
+  }
+
+  Json _signalView(Json event, int time) => {
+    'id': event['id'],
+    'seat': event['seat'],
+    'kind': event['kind'],
+    'signal': event['signal'],
+    'ageMs': max(0, time - (event['at'] as int)),
+  };
 
   Json _command(String uid, Json request) {
     final room = _member(uid, request);
@@ -235,7 +524,12 @@ class Authority {
           _changed(room);
           return {'room': null};
         }
-        _finish(room, room.players == 2 ? 1 - player : null, 'left');
+        _finish(
+          room,
+          room.players == 2 ? 1 - player : null,
+          'left',
+          forfeited: [player],
+        );
         _changed(room);
         return {'room': null};
       case 'play':
@@ -332,12 +626,18 @@ class Authority {
     room.deadline = now() + 30000;
   }
 
-  void _finish(Room room, int? winner, String reason) {
+  void _finish(
+    Room room,
+    int? winner,
+    String reason, {
+    List<int> forfeited = const [],
+  }) {
     room.finished = true;
     room.winner = winner;
     room.reason = reason;
+    room.forfeited = forfeited;
     room.deadline = 0;
-    history.add({
+    final entry = <String, dynamic>{
       'code': room.code,
       'uids': room.seats.map((s) => s.uid).toList(),
       'names': room.seats.map((s) => s.name).toList(),
@@ -345,7 +645,10 @@ class Authority {
       'winner': winner,
       'reason': reason,
       'finishedAt': now(),
-    });
+      'forfeited': forfeited,
+    };
+    history.add(entry);
+    _rankResult(entry);
     if (history.length > 2000) history.removeAt(0);
   }
 
@@ -389,7 +692,12 @@ class Authority {
                 room.seats.any((s) => _online(s))
             ? 1 - room.seats.indexOf(absent.single)
             : null;
-        _finish(room, winner, 'disconnect');
+        _finish(
+          room,
+          winner,
+          'disconnect',
+          forfeited: absent.map(room.seats.indexOf).toList(),
+        );
         _changed(room);
         continue;
       }
@@ -439,9 +747,14 @@ class Authority {
           },
       ],
       'chat': List.of(room.chat),
+      'tableSignals': [
+        for (final event in room.signals)
+          if (now() - (event['at'] as int) <= 3200) _signalView(event, now()),
+      ],
       'finished': room.finished,
       'winner': room.winner,
       'reason': room.reason,
+      'forfeited': room.forfeited,
       'seconds': max(0, ((room.deadline - now()) / 1000).ceil()),
       if (game != null)
         'game': {
@@ -461,6 +774,8 @@ class Authority {
   Json save() => {
     'rooms': [for (final r in rooms.values) r.toJson()],
     'history': history,
+    'leaders': _leaders,
+    'invites': _invites,
   };
 
   void restore(Json state) {
@@ -472,6 +787,17 @@ class Authority {
     history
       ..clear()
       ..addAll((state['history'] as List).cast<Json>());
+    _leaders
+      ..clear()
+      ..addAll((state['leaders'] as Map? ?? const {}).cast<String, Json>());
+    if (!state.containsKey('leaders')) {
+      for (final result in history) {
+        _rankResult(result);
+      }
+    }
+    _invites
+      ..clear()
+      ..addAll((state['invites'] as Map? ?? const {}).cast<String, Json>());
   }
 
   static String _text(Object? value, int maxLength) {
@@ -558,12 +884,14 @@ class Room {
   final String? password;
   final List<Seat> seats;
   final chat = <Json>[];
+  final signals = <Json>[];
   final reports = <String, Json>{};
   DominoEngine? game;
   int revision = 1, deadline = 0, touched;
   bool finished = false;
   int? winner, lastTile;
   String? reason;
+  List<int> forfeited = const [];
 
   Json toJson() => {
     'code': code,
@@ -584,6 +912,7 @@ class Room {
     'finished': finished,
     'winner': winner,
     'reason': reason,
+    'forfeited': forfeited,
     'lastTile': lastTile,
     'game': game?.savePrivate(),
   };
@@ -609,6 +938,7 @@ class Room {
         ..finished = j['finished'] as bool
         ..winner = j['winner'] as int?
         ..reason = j['reason'] as String?
+        ..forfeited = (j['forfeited'] as List? ?? const []).cast<int>()
         ..lastTile = j['lastTile'] as int?
         ..game = j['game'] == null
             ? null

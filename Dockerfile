@@ -7,6 +7,7 @@ RUN dart pub get --enforce-lockfile
 COPY server/lib ./lib
 COPY server/bin/server.dart ./bin/server.dart
 RUN mkdir -p /out && dart compile exe bin/server.dart -o /out/domna
+
 FROM dart:3.10.0
 RUN mkdir -p /data && chown 10001:10001 /data
 COPY --from=build /out/domna /usr/local/bin/domna
